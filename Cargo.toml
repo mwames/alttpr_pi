@@ -1,0 +1,8 @@
+[package]
+name = "alttpr_pi"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rust-libretro-sys = "0.3.2"
+sdl3 = "0.14.2"
