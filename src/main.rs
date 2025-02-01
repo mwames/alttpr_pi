@@ -1,32 +1,42 @@
-use std::{f32::consts::PI, ffi::CString, fs, sync::Mutex};
+use std::collections::HashMap;
+use std::ffi::{c_void, CString};
+use std::process::exit;
+use std::sync::{Mutex, OnceLock};
 
-use sdl3::sys::pixels::{SDL_PIXELFORMAT_ARGB8888, SDL_PIXELFORMAT_RGB565, SDL_PIXELFORMAT_XRGB8888};
+use sdl3::sys::pixels::SDL_PIXELFORMAT_RGB565;
+use sdl3::Sdl;
 use sdl3::{event::Event, rect::Rect};
 use sdl3::keyboard::Keycode;
-use sdl3::pixels::{Color, PixelFormat};
-use sdl3::timer::ticks;
-use rust_libretro_sys::{retro_deinit, retro_game_info, retro_init, retro_load_game, retro_run, retro_set_audio_sample, retro_set_audio_sample_batch, retro_set_environment, retro_set_input_poll, retro_set_input_state, retro_set_video_refresh, retro_unload_game};
+use sdl3::pixels::PixelFormat;
+use rust_libretro_sys::{
+    retro_deinit,
+    retro_game_info,
+    retro_init,
+    retro_load_game,
+    retro_run,
+    retro_set_audio_sample,
+    retro_set_audio_sample_batch,
+    retro_set_controller_port_device,
+    retro_set_environment,
+    retro_set_input_poll,
+    retro_set_input_state,
+    retro_set_video_refresh,
+    retro_unload_game,
+    RETRO_DEVICE_JOYPAD,
+    RETRO_DEVICE_NONE
+};
 
-use std::ffi::c_void;
+mod game_info;
+use game_info::GameInfo;
 
 const WIDTH: u32 = 256;
 const HEIGHT: u32 = 224;
+const PORT: u32 = 0;
 
 /// Our implementation of the callback
 unsafe extern "C" fn retro_environment(cmd: u32, data: *mut c_void) -> bool {
     match cmd {
-        0 => {
-            println!("retro_environment: Received cmd 0, returning false.");
-            false
-        }
-        10 => { // RETRO_ENVIRONMENT_SET_PIXEL_FORMAT
-            println!("Setting pixel format to RGB565.");
-            let format = 0; // RETRO_PIXEL_FORMAT_XRGB8888
-            *(data as *mut i32) = format;
-            true
-        }
         _ => {
-            println!("retro_environment: Unknown cmd {}, returning false.", cmd);
             false
         }
     }
@@ -39,7 +49,6 @@ struct Framebuffer {
 }
 static FRAMEBUFFER: Mutex<Option<Framebuffer>> = Mutex::new(None);
 unsafe extern "C" fn retro_video_refresh(data: *const c_void, width: u32, height: u32, pitch: usize) {
-    println!("retro_video_refresh: width={}, height={}, pitch={}", width, height, pitch);
     if data.is_null() {
         return;
     }
@@ -55,12 +64,32 @@ unsafe extern "C" fn retro_video_refresh(data: *const c_void, width: u32, height
     });
 }
 
+
+static INPUT_STATE: OnceLock<Mutex<HashMap<(u32, u32, u32, u32), i16>>> = OnceLock::new();
+fn get_input_state() -> &'static Mutex<HashMap<(u32, u32, u32, u32), i16>> {
+    INPUT_STATE.get_or_init(|| Mutex::new(HashMap::new()))
+}
 unsafe extern "C" fn retro_input_poll() {
-    // Do nothing for now, just prevent a null function pointer crash
+    // println!("retro_input_poll");
+    // let input_state = get_input_state();
+    // let mut input_map = input_state.lock().unwrap();
+    // input_map.insert((1, 1, 0, 7), 1);
 }
 
-unsafe extern "C" fn retro_input_state(_port: u32, _device: u32, _index: u32, _id: u32) -> i16 {
-    0 // No button presses
+/*
+* This function is called by the libretro core to get the state of the input
+* The arguments are:
+* port: The port number of the controller
+* device: The device type of the controller
+* index: The index of the controller
+* id: The ID of the button
+* The function should return 1 if the button is pressed, and 0 if it is not
+*/
+#[no_mangle]
+unsafe extern "C" fn retro_input_state(port: u32, device: u32, index: u32, id: u32) -> i16 {
+    let input_state = get_input_state();
+    let input_map = input_state.lock().unwrap();
+    *input_map.get(&(port, device, index, id)).unwrap_or(&0)
 }
 
 unsafe extern "C" fn retro_audio_sample(_left: i16, _right: i16) {
@@ -71,16 +100,126 @@ unsafe extern "C" fn retro_audio_sample_batch(_data: *const i16, _frames: usize)
     0 // No audio output
 }
 
-fn main() {
-    let path_cstr = CString::new("/home/matt/repos/alttpr_pi/zelda.smc").expect("CString conversion failed");
-    let file_game: retro_game_info = retro_game_info {
-        path: path_cstr.as_ptr(),
-        data: std::ptr::null(),
-        size: 0,
-        meta: std::ptr::null(),
-    };
+// ===== BUNCH OF GARBAGE =====
+fn get_joystick(sdl_context:  &Sdl) -> sdl3::joystick::Joystick {
+    let joystick_subsystem = sdl_context.joystick().unwrap();
+    joystick_subsystem.set_joystick_events_enabled(true);
+    let mut joysticks = joystick_subsystem.joysticks().unwrap();
+    let js = joysticks.pop().unwrap();
+    joystick_subsystem.open(js).unwrap()
+}
 
-    unsafe {
+// TODO: Consider using a hashmap to map SDL keycodes to SNES button IDs
+fn sdl_to_snes(sdl_keycode: u8) -> u32 {
+    match sdl_keycode {
+        0 => 0, // B
+        1 => 8, // A
+        2 => 1, // Y
+        3 => 9, // X
+        4 => 10, // L
+        5 => 11, // R
+        6 => 2, // SELECT
+        7 => 3, // START
+        _ => sdl_keycode as u32,
+    }
+}
+
+fn handle_input(sdl_context: &Sdl) {
+    // Handle events
+    let input_state = get_input_state();
+    let mut input_map = input_state.lock().unwrap();
+    let mut event_pump = sdl_context.event_pump().unwrap();
+    for event in event_pump.poll_iter() {
+        match event {
+            Event::Quit { .. } | Event::KeyDown { keycode: Some(Keycode::Escape), .. } => {
+                // clean up the libretro core
+                unsafe {
+                    retro_unload_game();
+                    retro_deinit();
+                }
+                exit(0);
+            },
+            Event::JoyButtonDown { button_idx, .. } => {
+                if button_idx < 8 {
+                    input_map.insert((PORT, 1, 0, sdl_to_snes(button_idx) as u32), 1);
+                }
+            },
+            Event::JoyButtonUp { button_idx, .. } => {
+                if button_idx < 8 {
+                    input_map.insert((PORT, 1, 0, sdl_to_snes(button_idx) as u32), 0);
+                }
+            },
+            Event::JoyHatMotion { state, .. } => {
+                match state {
+                    // No Input
+                    sdl3::joystick::HatState::Centered => {
+                        input_map.insert((PORT, 1, 0, 4), 0);
+                        input_map.insert((PORT, 1, 0, 5), 0);
+                        input_map.insert((PORT, 1, 0, 6), 0);
+                        input_map.insert((PORT, 1, 0, 7), 0);
+                    },
+                    // Cardinal Directions
+                    sdl3::joystick::HatState::Up => {
+                        input_map.insert((PORT, 1, 0, 4), 1);
+                        input_map.insert((PORT, 1, 0, 5), 0);
+                        input_map.insert((PORT, 1, 0, 6), 0);
+                        input_map.insert((PORT, 1, 0, 7), 0);
+                    },
+                    sdl3::joystick::HatState::Down => {
+                        input_map.insert((PORT, 1, 0, 4), 0);
+                        input_map.insert((PORT, 1, 0, 5), 1);
+                        input_map.insert((PORT, 1, 0, 6), 0);
+                        input_map.insert((PORT, 1, 0, 7), 0);
+                    },
+                    sdl3::joystick::HatState::Left => {
+                        input_map.insert((PORT, 1, 0, 4), 0);
+                        input_map.insert((PORT, 1, 0, 5), 0);
+                        input_map.insert((PORT, 1, 0, 6), 1);
+                        input_map.insert((PORT, 1, 0, 7), 0);
+                    },
+                    sdl3::joystick::HatState::Right => {
+                        input_map.insert((PORT, 1, 0, 4), 0);
+                        input_map.insert((PORT, 1, 0, 5), 0);
+                        input_map.insert((PORT, 1, 0, 6), 0);
+                        input_map.insert((PORT, 1, 0, 7), 1);
+                    },
+                    // Diagonal Directions
+                    sdl3::joystick::HatState::RightUp => {
+                        input_map.insert((PORT, 1, 0, 4), 1);
+                        input_map.insert((PORT, 1, 0, 5), 0);
+                        input_map.insert((PORT, 1, 0, 6), 0);
+                        input_map.insert((PORT, 1, 0, 7), 1);
+                    },
+                    sdl3::joystick::HatState::RightDown => {
+                        input_map.insert((PORT, 1, 0, 4), 0);
+                        input_map.insert((PORT, 1, 0, 5), 1);
+                        input_map.insert((PORT, 1, 0, 6), 0);
+                        input_map.insert((PORT, 1, 0, 7), 1);
+                    },
+                    sdl3::joystick::HatState::LeftUp => {
+                        input_map.insert((PORT, 1, 0, 4), 1);
+                        input_map.insert((PORT, 1, 0, 5), 0);
+                        input_map.insert((PORT, 1, 0, 6), 1);
+                        input_map.insert((PORT, 1, 0, 7), 0);
+                    },
+                    sdl3::joystick::HatState::LeftDown => {
+                        input_map.insert((PORT, 1, 0, 4), 0);
+                        input_map.insert((PORT, 1, 0, 5), 1);
+                        input_map.insert((PORT, 1, 0, 6), 1);
+                        input_map.insert((PORT, 1, 0, 7), 0);
+                    }
+                }
+            },
+            _ => {}
+        }
+    }
+    // println!("poop: {:?}", input_map);
+}
+
+fn main() {
+    let game_info = GameInfo::new(CString::new("/home/matt/repos/alttpr_pi/rand.sfc").unwrap());
+
+    let loaded = unsafe {
         retro_set_environment(Some(retro_environment));
         retro_set_video_refresh(Some(retro_video_refresh));
         retro_set_input_poll(Some(retro_input_poll));
@@ -90,20 +229,29 @@ fn main() {
 
         retro_init();
         println!("Libretro core initialized!");
-        let loaded = retro_load_game(&file_game as *const retro_game_info);
-        if loaded {
-            println!("Game loaded!");
-        } else {
-            println!("Failed to load game!");
-        }
+        retro_load_game(&game_info.build() as *const retro_game_info)
+    };
+    
+    if loaded {
+        println!("Game loaded!");
+    } else {
+        println!("Failed to load game!");
     }
+
+    // Set up controllers
+    unsafe {
+        retro_set_controller_port_device(0, RETRO_DEVICE_JOYPAD);
+        retro_set_controller_port_device(1, RETRO_DEVICE_NONE);
+    
+    }
+
     // Store the keycode of the key that was pressed last
     let mut last_keycode: Option<Keycode> = None;
     // Do up the window
     let sdl_context = sdl3::init().unwrap();
     let video_subsystem = sdl_context.video().unwrap();
     let window = video_subsystem
-        .window("A Link to the PI", WIDTH, HEIGHT)
+        .window("A Link to the PI", WIDTH * 4, HEIGHT * 4)
         .position_centered()
         .resizable()
         .build()
@@ -116,51 +264,22 @@ fn main() {
         .create_texture_streaming(pixel_format, WIDTH, HEIGHT)
         .expect("Failed to create texture");
     // Run while the last key pressed was not the escape key
-    while last_keycode != Some(Keycode::Escape) {
-        // Handle events
-        let mut event_pump = sdl_context.event_pump().unwrap();
-        for event in event_pump.poll_iter() {
-            match event {
-                Event::Quit { .. }
-                | Event::KeyDown {
-                    keycode: Some(Keycode::Escape),
-                    ..
-                } => {
-                    // clean up the libretro core
-                    unsafe {
-                        retro_unload_game();
-                        retro_deinit();
-                    }
-                    last_keycode = Some(Keycode::Escape);
-                },
-                _ => {}
-            }
-        }
-        // Change the clear color based on the time
-        // let now = ticks() as f32 / 1000.0;
-        // let red: f32 = 0.5 + 0.5 * (now as f32).sin();
-        // let green: f32 = 0.5 + 0.5 * ((now as f32) + PI * 2.0/3.0).sin();
-        // let blue: f32 = 0.5 + 0.5 * ((now as f32) + PI * 4.0/3.0).sin();
-        // let rgb = Color::RGB((red * 255.0) as u8, (green * 255.0) as u8, (blue * 255.0) as u8);
-        // canvas.set_draw_color(rgb);
-        // canvas.clear();
-        // canvas.present();
 
+    let joystick = get_joystick(&sdl_context);
+
+    loop {
+        handle_input(&sdl_context);
         unsafe {
             retro_run();
         }
         let framebuffer = FRAMEBUFFER.lock().unwrap();
-        let window_size = canvas.output_size().unwrap();
-        println!("Window size: {:?}", window_size);
         if let Some(ref fb) = *framebuffer {
-            println!("Framebuffer size: {}x{}", fb.width, fb.height);
-            
             texture.update(None, &fb.data, (fb.width * 4) as usize).unwrap();
             canvas.clear();
     
             // Scale to fit window
             let window_size = canvas.output_size().unwrap();
-            let dst_rect = Rect::new(0, 0, WIDTH, HEIGHT);
+            let dst_rect = Rect::new(0, 0, window_size.0, window_size.1);
             
             canvas.copy(&texture, None, dst_rect).unwrap();
             canvas.present();
