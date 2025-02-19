@@ -3,6 +3,7 @@ use std::ffi::{c_void, CString};
 use std::process::exit;
 use std::sync::{Mutex, OnceLock};
 
+use audio_subsystem::{initialize_audio_subsystem, retro_audio_sample_batch};
 use sdl3::sys::pixels::SDL_PIXELFORMAT_RGB565;
 use sdl3::Sdl;
 use sdl3::{event::Event, rect::Rect};
@@ -29,11 +30,13 @@ use rust_libretro_sys::{
 mod game_info;
 use game_info::GameInfo;
 
+mod audio_subsystem;
+
 const WIDTH: u32 = 256;
 const HEIGHT: u32 = 224;
 const PORT: u32 = 0;
 
-/// Our implementation of the callback
+// Our implementation of the callback
 unsafe extern "C" fn retro_environment(cmd: u32, data: *mut c_void) -> bool {
     match cmd {
         _ => {
@@ -90,14 +93,6 @@ unsafe extern "C" fn retro_input_state(port: u32, device: u32, index: u32, id: u
     let input_state = get_input_state();
     let input_map = input_state.lock().unwrap();
     *input_map.get(&(port, device, index, id)).unwrap_or(&0)
-}
-
-unsafe extern "C" fn retro_audio_sample(_left: i16, _right: i16) {
-    // Do nothing for now, just avoid null function pointer crash
-}
-
-unsafe extern "C" fn retro_audio_sample_batch(_data: *const i16, _frames: usize) -> usize {
-    0 // No audio output
 }
 
 // ===== BUNCH OF GARBAGE =====
@@ -219,23 +214,15 @@ fn handle_input(sdl_context: &Sdl) {
 fn main() {
     let game_info = GameInfo::new(CString::new("/home/matt/repos/alttpr_pi/rand.sfc").unwrap());
 
-    let loaded = unsafe {
+    unsafe {
         retro_set_environment(Some(retro_environment));
         retro_set_video_refresh(Some(retro_video_refresh));
         retro_set_input_poll(Some(retro_input_poll));
         retro_set_input_state(Some(retro_input_state));
-        retro_set_audio_sample(Some(retro_audio_sample));
         retro_set_audio_sample_batch(Some(retro_audio_sample_batch));
-
         retro_init();
         println!("Libretro core initialized!");
-        retro_load_game(&game_info.build() as *const retro_game_info)
-    };
-    
-    if loaded {
-        println!("Game loaded!");
-    } else {
-        println!("Failed to load game!");
+        retro_load_game(&game_info.build() as *const retro_game_info);
     }
 
     // Set up controllers
@@ -266,6 +253,9 @@ fn main() {
     // Run while the last key pressed was not the escape key
 
     let joystick = get_joystick(&sdl_context);
+
+    // Audio shit
+    let (a, b, c) = initialize_audio_subsystem(&sdl_context).unwrap();
 
     loop {
         handle_input(&sdl_context);
